@@ -1,7 +1,7 @@
 {
   "id": "wsmc",
   "name": "WSMC",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "description": "Enable WebSocket support for Minecraft Java via Velocity proxy.",
   "authors": ["WSMC Team"],
   "main": "com.wsmc.velocity.WSMCPlugin"
