@@ -66,7 +66,7 @@ cd WSMC-Velocity
 
 ## 客户端连接
 
-安装此插件后，玩家可仿照 WSMC 客户端的格式连接：
+安装此插件后，玩家可使用安装了 WSMC 客户端连接：
 
 ```
 # 不安全的 WebSocket
@@ -79,8 +79,6 @@ wss://your-proxy.com:25566/mc
 ws://host.com@1.2.3.4:25566/mc
 wss://sni.com:host.com@1.2.3.4:25566/mc
 ```
-
-玩家也可以使用安装了 WSMC 客户端的启动器直接连接。
 
 ---
 
