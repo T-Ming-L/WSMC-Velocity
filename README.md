@@ -1,5 +1,7 @@
 # WSMC for Velocity
 
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+
 让 Velocity 代理支持 WebSocket 连接的插件。受 [rikka0w0/wsmc](https://github.com/rikka0w0/wsmc) 启发，适用于需要在 CDN 后面隐藏服务器的场景。
 
 > 大部分 CDN 免费套餐不支持 TCP 代理，通过 WebSocket 方式可绕过此限制，有效防御 DDoS 攻击。
@@ -29,8 +31,8 @@ MC 客户端 ──WebSocket──► WSMC 插件(25566) ──TCP──► loca
 ### 构建
 
 ```bash
-git clone https://github.com/yourname/wsmc-velocity.git
-cd wsmc-velocity
+git clone https://github.com/T-Ming-L/WSMC-Velocity.git
+cd WSMC-Velocity
 ./gradlew shadowJar
 ```
 
@@ -136,7 +138,11 @@ A: CDN 通常会在 WebSocket 握手请求中添加 `X-Forwarded-For` 等 Header
 
 ## 开源协议
 
-MIT License
+[GNU General Public License v3.0](LICENSE)
+
+Copyright (C) 2024 WSMC Team
+
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
 
 ---
 
