@@ -66,7 +66,7 @@ cd WSMC-Velocity
 
 ## 客户端连接
 
-安装此插件后，玩家可使用安装了 WSMC 客户端的格式连接：
+安装此插件后，玩家可使用安装了 WSMC 的客户端连接：
 
 ```
 # 不安全的 WebSocket
@@ -115,12 +115,12 @@ Client → CDN [X-Forwarded-For: 1.2.3.4] → WSMC Plugin(25566)
 
 ## 与 WSMC Mod / Spigot 版对比
 
-| | [WSMC Mod](https://github.com/rikka0w0/wsmc) | [WSMC for Spigot](https://github.com/T-Ming-L/WSMC-Spigot) | WSMC for Velocity |
-| -------- | ------------- | --------------------- | ----------------- |
-| 运行位置 | 游戏服务器内 | Spigot/Paper 服务器内 | Velocity 代理 |
-| 适用场景 | 单服 / 无代理 | 单服 / 无代理 | 群组服 / Velocity 已有 |
-| 后端兼容 | 直接处理 | 走本地服务器端口 | 走 Velocity forwarding |
-| 配置方式 | JVM 系统属性 | `wsmc.properties` | `wsmc.properties` |
+|          | [WSMC Mod](https://github.com/rikka0w0/wsmc) | WSMC for Velocity     | [WSMC for Spigot](https://github.com/T-Ming-L/WSMC-Spigot) |
+| -------- | -------------------------------------------- | --------------------- | ---------------------------------------------------------- |
+| 运行位置 | 游戏服务器内                                 | Spigot/Paper 服务器内 | Velocity 代理                                              |
+| 适用场景 | 单服 / 无代理                                | 单服 / 无代理         | 群组服 / Velocity 已有                                     |
+| 后端兼容 | 直接处理                                     | 走本地服务器端口      | 走 Velocity forwarding                                     |
+| 配置方式 | JVM 系统属性                                 | `wsmc.properties`     | `wsmc.properties`                                          |
 
 ---
 
