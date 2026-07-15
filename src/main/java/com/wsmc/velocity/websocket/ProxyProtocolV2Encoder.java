@@ -133,9 +133,25 @@ public final class ProxyProtocolV2Encoder {
         out.writeByte(VER_CMD);
         out.writeByte(FAM_PROTO_IPV6);
         out.writeShort(ADDR_LEN_IPV6);
-        out.writeBytes(src.getAddress()); // 16 B
-        out.writeBytes(dst.getAddress()); // 16 B
+        // The backend connection commonly has an IPv4 local address even when
+        // the real client is IPv6. Map either IPv4 endpoint into IPv6 so the
+        // AF_INET6 address block always has the declared 36-byte length.
+        out.writeBytes(toIPv6Bytes(src)); // 16 B
+        out.writeBytes(toIPv6Bytes(dst)); // 16 B
         out.writeShort(srcPort); // 2 B
         out.writeShort(dstPort); // 2 B
+    }
+
+    private static byte[] toIPv6Bytes(InetAddress address) {
+        byte[] bytes = address.getAddress();
+        if (bytes.length == 16) {
+            return bytes;
+        }
+
+        byte[] mapped = new byte[16];
+        mapped[10] = (byte) 0xFF;
+        mapped[11] = (byte) 0xFF;
+        System.arraycopy(bytes, 0, mapped, 12, 4);
+        return mapped;
     }
 }

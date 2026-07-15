@@ -182,13 +182,8 @@ public class WebSocketProxyHandler extends SimpleChannelInboundHandler<WebSocket
                 // X-Forwarded-For may contain proxy chain; take the first (original) IP
                 String ip = headerValue.split(",")[0].trim();
                 try {
-                    // Parse with optional port
-                    if (ip.contains(":")) {
-                        String[] parts = ip.split(":");
-                        return new InetSocketAddress(parts[0], Integer.parseInt(parts[1]));
-                    }
-                    return new InetSocketAddress(ip, 0);
-                } catch (Exception e) {
+                    return ClientAddressParser.parse(ip);
+                } catch (IllegalArgumentException e) {
                     logger.warn("[WSMC] Failed to parse {} header value '{}', using direct address",
                             headerName, headerValue);
                 }
