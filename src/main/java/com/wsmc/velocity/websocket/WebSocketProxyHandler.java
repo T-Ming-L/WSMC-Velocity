@@ -22,6 +22,7 @@ import com.wsmc.velocity.WSMCConfig;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufUtil;
+import io.netty.buffer.Unpooled;
 import io.netty.channel.*;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.SocketChannel;
@@ -35,6 +36,9 @@ import com.velocitypowered.api.proxy.ProxyServer;
 import org.slf4j.Logger;
 
 import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Bridges a WebSocket connection into Velocity's normal Minecraft pipeline.
@@ -63,6 +67,22 @@ public class WebSocketProxyHandler extends SimpleChannelInboundHandler<WebSocket
     private NioEventLoopGroup backendGroup;
     /** Real client IP resolved from WebSocket handshake headers. */
     private InetSocketAddress realClientAddr;
+    /** Whether a LOGIN handshake has been detected (not a STATUS ping). */
+    private boolean loginDetected = false;
+    /** Player username extracted from LoginStart packet. */
+    private String playerName = null;
+    /**
+     * Buffer for the first data frame(s) arriving before the backend
+     * connection is established. Without this, the initial Minecraft
+     * handshake packet is silently dropped, causing connection timeouts.
+     */
+    private ByteBuf pendingFrame = null;
+    /**
+     * Periodic keepalive ping task – prevents CDN / proxy
+     * (e.g. Cloudflare 60–100s) from closing the WebSocket due to
+     * inactivity.
+     */
+    private ScheduledFuture<?> keepaliveTask = null;
 
     public WebSocketProxyHandler(ProxyServer proxy, WSMCConfig config, Logger logger) {
         super(false); // Do not auto-release – we forward the buffer
@@ -86,16 +106,37 @@ public class WebSocketProxyHandler extends SimpleChannelInboundHandler<WebSocket
     public void userEventTriggered(ChannelHandlerContext ctx, Object evt) throws Exception {
         // WebSocket handshake complete – capture real IP, then connect.
         if (evt instanceof io.netty.handler.codec.http.websocketx.WebSocketServerProtocolHandler.HandshakeComplete complete) {
-            // Resolve real client IP
+            // Resolve real client IP (checks CDN headers before fallback)
             this.realClientAddr = resolveRealClientAddress(ctx, complete);
 
+            // Start keepalive pings to prevent CDN/proxy idle timeout
+            startKeepalive(ctx);
+
             if (config.isDebug()) {
-                logger.info("[WSMC] WebSocket handshake complete, URI: {}, realClient: {}",
-                        complete.requestUri(), realClientAddr);
+                logger.info("[WSMC] Handshake complete, URI: {}, direct addr: {}",
+                        complete.requestUri(), ctx.channel().remoteAddress());
             }
             connectToBackend(ctx);
         }
         super.userEventTriggered(ctx, evt);
+    }
+
+    /**
+     * Starts a periodic keepalive ping (every 15 seconds) so that CDNs /
+     * reverse proxies do not close the WebSocket due to inactivity.
+     * The client Netty stack auto-responds with Pong per RFC 6455.
+     */
+    private void startKeepalive(ChannelHandlerContext ctx) {
+        keepaliveTask = ctx.channel().eventLoop().scheduleWithFixedDelay(
+                () -> {
+                    if (ctx.channel().isActive()) {
+                        ctx.channel().writeAndFlush(new PingWebSocketFrame());
+                    }
+                },
+                15, 15, TimeUnit.SECONDS);
+        if (config.isDebug()) {
+            logger.info("[WSMC] Keepalive ping started (interval: 15s)");
+        }
     }
 
     /**
@@ -144,6 +185,16 @@ public class WebSocketProxyHandler extends SimpleChannelInboundHandler<WebSocket
                     }
                 }
 
+                // ── Flush any data buffered while backend was connecting ──
+                if (pendingFrame != null) {
+                    backendChannel.writeAndFlush(pendingFrame);
+                    if (config.isDebug()) {
+                        logger.info("[WSMC] Flushed buffered frame ({} bytes) to backend",
+                                pendingFrame.readableBytes());
+                    }
+                    pendingFrame = null;
+                }
+
                 if (config.isDebug()) {
                     logger.info("[WSMC] Connected to backend: {}", backendAddr);
                 }
@@ -169,34 +220,62 @@ public class WebSocketProxyHandler extends SimpleChannelInboundHandler<WebSocket
     // ── Real IP resolution ────────────────────────────────────────────
 
     /**
-     * Resolve the real client IP address from the WebSocket handshake.
-     * Checks the configured HTTP header first (e.g., X-Forwarded-For),
-     * falls back to the direct socket remote address.
+     * Resolve the real client IP address from the WebSocket handshake
+     * HTTP headers. Checks common CDN / reverse-proxy headers
+     * ({@code X-Forwarded-For}, {@code CF-Connecting-IP},
+     * {@code X-Real-IP}) and logs all available headers for
+     * diagnostics. Falls back to the direct socket remote address.
      */
     private InetSocketAddress resolveRealClientAddress(ChannelHandlerContext ctx,
             io.netty.handler.codec.http.websocketx.WebSocketServerProtocolHandler.HandshakeComplete complete) {
-        if (config.isProxyProtocolEnabled()) {
-            String headerName = config.getProxyProtocolRealIpHeader();
-            String headerValue = complete.requestHeaders().get(headerName);
-            if (headerValue != null && !headerValue.isEmpty()) {
-                // X-Forwarded-For may contain proxy chain; take the first (original) IP
-                String ip = headerValue.split(",")[0].trim();
-                try {
-                    // Parse with optional port
-                    if (ip.contains(":")) {
-                        String[] parts = ip.split(":");
-                        return new InetSocketAddress(parts[0], Integer.parseInt(parts[1]));
-                    }
-                    return new InetSocketAddress(ip, 0);
-                } catch (Exception e) {
-                    logger.warn("[WSMC] Failed to parse {} header value '{}', using direct address",
-                            headerName, headerValue);
+        var headers = complete.requestHeaders();
+
+        // ── Dump all HTTP headers for debug ────────────────────────────
+        if (config.isDebug()) {
+            StringBuilder sb = new StringBuilder("[WSMC] WS request headers:");
+            headers.forEach(e -> sb.append("\n  ").append(e.getKey()).append(": ").append(e.getValue()));
+            logger.info(sb.toString());
+        }
+
+        // ── Collect candidate headers ───────────────────────────────────
+        String configuredHeader = config.getProxyProtocolRealIpHeader();
+        String[] candidates = {
+                configuredHeader,
+                "X-Forwarded-For",
+                "CF-Connecting-IP",
+                "X-Real-IP",
+                "True-Client-IP",
+                "X-Client-IP",
+                "WL-Proxy-Client-IP",
+                "Proxy-Client-IP"
+        };
+
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        for (String hdr : candidates) {
+            if (hdr == null || hdr.isEmpty() || !seen.add(hdr))
+                continue;
+
+            String headerValue = headers.get(hdr);
+            if (headerValue == null || headerValue.isEmpty())
+                continue;
+
+            // Proxy chains: take the first (leftmost) IP
+            String ip = headerValue.split(",")[0].trim();
+            try {
+                return new InetSocketAddress(ip, 0);
+            } catch (Exception e) {
+                if (config.isDebug()) {
+                    logger.warn("[WSMC] Failed to parse header '{}' value '{}'", hdr, headerValue);
                 }
             }
         }
-        // Fallback: direct socket address
+
+        // ── Fallback: direct socket address ─────────────────────────────
         java.net.SocketAddress remote = ctx.channel().remoteAddress();
         if (remote instanceof InetSocketAddress isa) {
+            if (config.isDebug()) {
+                logger.info("[WSMC] No proxy header, using direct addr: {}", isa.getHostString());
+            }
             return isa;
         }
         return null;
@@ -207,8 +286,19 @@ public class WebSocketProxyHandler extends SimpleChannelInboundHandler<WebSocket
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, WebSocketFrame frame) {
         if (frame instanceof BinaryWebSocketFrame binaryFrame) {
-            // Forward binary frame content to backend
             ByteBuf content = binaryFrame.content();
+
+            // Phase 1: Check Minecraft handshake to distinguish login vs status ping
+            if (!loginDetected && content.readableBytes() > 0) {
+                checkMinecraftHandshakeAndLog(ctx, content);
+            }
+            // Phase 2: If login was detected, try to extract player name from LoginStart
+            if (loginDetected && playerName == null && content.readableBytes() > 0) {
+                int ri = content.readerIndex();
+                tryParseLoginStart(content);
+                content.readerIndex(ri);
+            }
+
             if (config.isDumpBytes()) {
                 logger.info("[WSMC] C→S ({} bytes):\n{}", content.readableBytes(),
                         ByteBufUtil.prettyHexDump(content));
@@ -217,6 +307,19 @@ public class WebSocketProxyHandler extends SimpleChannelInboundHandler<WebSocket
             if (backendChannel != null && backendChannel.isActive()) {
                 // Retain before writing since auto-release is off
                 backendChannel.writeAndFlush(content.retain());
+            } else {
+                // Backend not yet connected – buffer the frame instead of dropping it.
+                // This is critical: the first frame contains the Minecraft handshake
+                // and must not be lost.
+                if (pendingFrame == null) {
+                    pendingFrame = content.retain();
+                } else {
+                    // Concatenate with existing buffered data (rare edge case)
+                    pendingFrame = Unpooled.wrappedBuffer(pendingFrame, content.retain());
+                }
+                if (config.isDebug()) {
+                    logger.info("[WSMC] Backend not ready, buffered frame ({} bytes)", content.readableBytes());
+                }
             }
         } else if (frame instanceof CloseWebSocketFrame) {
             // Client closed WebSocket
@@ -229,10 +332,138 @@ public class WebSocketProxyHandler extends SimpleChannelInboundHandler<WebSocket
         }
     }
 
+    // ── Minecraft handshake inspection ────────────────────────────────
+
+    /**
+     * Peeks at the first binary frame to check the Minecraft handshake
+     * {@code nextState} field. Sets {@code loginDetected} for LOGIN (2)
+     * requests, and tries to parse a subsequent LoginStart packet
+     * from the same frame if present.
+     */
+    private void checkMinecraftHandshakeAndLog(ChannelHandlerContext ctx, ByteBuf content) {
+        int readerIndex = content.readerIndex();
+        try {
+            // ── Skip VarInt packet length ──────────────────────────────
+            readVarInt(content);
+            // ── Packet ID ──────────────────────────────────────────────
+            int packetId = readVarInt(content);
+            if (packetId != 0x00) {
+                if (config.isDebug()) {
+                    logger.info("[WSMC] First frame packetId={}, raw hex dump:", packetId);
+                    content.readerIndex(readerIndex);
+                    int len = Math.min(content.readableBytes(), 64);
+                    logger.info("\n{}", ByteBufUtil.prettyHexDump(content, readerIndex, len));
+                    content.readerIndex(readerIndex);
+                }
+                return; // Not a handshake packet
+            }
+            // ── Handshake fields ───────────────────────────────────────
+            // Protocol version
+            readVarInt(content);
+            // Server address
+            readString(content);
+            // Server port (2 bytes)
+            if (content.readableBytes() < 2)
+                return;
+            content.readShort();
+            // Next state
+            int nextState = readVarInt(content);
+
+            if (nextState == 2) {
+                // LOGIN – real player connection
+                loginDetected = true;
+                String ip = (realClientAddr != null) ? realClientAddr.getHostString() : "unknown";
+                logger.info("[WSMC] Player connecting - IP: {}, port: ws{}", ip, config.getWsPort());
+                // Try to parse LoginStart from remaining bytes in the same frame
+                if (content.readableBytes() > 0) {
+                    tryParseLoginStart(content);
+                }
+            }
+        } catch (Exception e) {
+            if (config.isDebug()) {
+                logger.warn("[WSMC] Handshake parse error: {}", e.getMessage());
+                content.readerIndex(readerIndex);
+                int len = Math.min(content.readableBytes(), 64);
+                logger.warn("First {} bytes:\n{}", len, ByteBufUtil.prettyHexDump(content, readerIndex, len));
+            }
+        } finally {
+            content.readerIndex(readerIndex);
+        }
+    }
+
+    /**
+     * Tries to parse a Minecraft LoginStart packet (packet ID 0x00 in the LOGIN
+     * state) to extract the player username. The Minecraft wire format is:
+     * {@code VarInt packetLength, VarInt packetId(0x00), String username}.
+     * Does NOT modify the readerIndex on failure — the caller is responsible
+     * for restoring it.
+     */
+    private void tryParseLoginStart(ByteBuf content) {
+        int localRi = content.readerIndex();
+        try {
+            // ── Skip VarInt packet length ──────────────────────────────
+            readVarInt(content);
+            // ── Packet ID ──────────────────────────────────────────────
+            int packetId = readVarInt(content);
+            if (packetId != 0x00) {
+                return; // Not a LoginStart packet
+            }
+            String name = readString(content);
+            if (name != null && !name.isEmpty()) {
+                playerName = name;
+                String ip = (realClientAddr != null) ? realClientAddr.getHostString() : "unknown";
+                logger.info("[WSMC] {} connected - IP: {}:{}", playerName, ip, config.getWsPort());
+                // Overwrite the earlier "Player connecting" message with the named one
+            }
+        } catch (Exception e) {
+            // Restore only on failure – LoginStart might be in a separate frame
+            content.readerIndex(localRi);
+        }
+    }
+
+    private static int readVarInt(ByteBuf buf) {
+        int result = 0;
+        int shift = 0;
+        byte b;
+        do {
+            b = buf.readByte();
+            result |= (b & 0x7F) << shift;
+            shift += 7;
+            if (shift > 35) {
+                throw new RuntimeException("VarInt too big");
+            }
+        } while ((b & 0x80) != 0);
+        return result;
+    }
+
+    private static String readString(ByteBuf buf) {
+        int length = readVarInt(buf);
+        if (length < 0 || length > buf.readableBytes()) {
+            throw new RuntimeException("Invalid string length");
+        }
+        byte[] bytes = new byte[length];
+        buf.readBytes(bytes);
+        return new String(bytes, StandardCharsets.UTF_8);
+    }
+
     // ── Cleanup ────────────────────────────────────────────────────────
 
     @Override
     public void channelInactive(ChannelHandlerContext ctx) {
+        // Cancel keepalive ping task
+        if (keepaliveTask != null) {
+            keepaliveTask.cancel(false);
+            keepaliveTask = null;
+        }
+        if (loginDetected) {
+            String ip = (realClientAddr != null) ? realClientAddr.getHostString() : "unknown";
+            logger.info("[WSMC] {} disconnected - IP: {}", playerName != null ? playerName : "unknown", ip);
+        }
+        // Release any buffered frame that was never flushed
+        if (pendingFrame != null) {
+            pendingFrame.release();
+            pendingFrame = null;
+        }
         if (backendChannel != null) {
             backendChannel.close();
         }
@@ -243,11 +474,23 @@ public class WebSocketProxyHandler extends SimpleChannelInboundHandler<WebSocket
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-        logger.error("[WSMC] Error in WebSocket proxy: {}", cause.getMessage());
-        if (config.isDebug()) {
-            cause.printStackTrace();
+        String msg = cause.getMessage();
+        // Log transient errors at debug level, unexpected ones at error level
+        if (msg != null && (msg.contains("Connection reset") || msg.contains("closed")
+                || msg.contains("timeout") || msg.contains("refused"))) {
+            if (config.isDebug()) {
+                logger.warn("[WSMC] WS proxy: {} (expected)", msg);
+            }
+        } else {
+            logger.error("[WSMC] WS proxy error: {}", msg);
+            if (config.isDebug()) {
+                cause.printStackTrace();
+            }
         }
-        ctx.close();
+        // Only close if the channel is still open – avoids cascading close
+        if (ctx.channel().isActive()) {
+            ctx.close();
+        }
     }
 
     // ── Backend → Client Handler (inner class) ─────────────────────────

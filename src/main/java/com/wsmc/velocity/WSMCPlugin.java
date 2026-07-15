@@ -61,6 +61,9 @@ public class WSMCPlugin {
             logger.info("WSMC debug logging enabled.");
         }
 
+        // Suppress Velocity's built-in "[connected player] ... has connected" log
+        suppressConnectedPlayerLog();
+
         // Start WebSocket server
         this.wsServer = new WebSocketServer(proxy, config, logger);
         try {
@@ -72,6 +75,48 @@ public class WSMCPlugin {
             logger.info("WSMC max frame payload length: {}", config.getMaxFramePayloadLength());
         } catch (Exception e) {
             logger.error("Failed to start WSMC WebSocket server", e);
+        }
+    }
+
+    /**
+     * Uses Log4j2's {@code RegexFilter} (via reflection to avoid a compile-time
+     * dependency on log4j-core) to suppress Velocity's built-in
+     * "[connected player] ... has connected" console line. WSMC provides its own
+     * more useful log with the real client IP.
+     */
+    private void suppressConnectedPlayerLog() {
+        try {
+            // ── Resolve Log4j2 core classes (provided by Velocity at runtime) ──
+            Class<?> logManager = Class.forName("org.apache.logging.log4j.LogManager");
+            Class<?> loggerContext = Class.forName("org.apache.logging.log4j.core.LoggerContext");
+            Class<?> configuration = Class.forName("org.apache.logging.log4j.core.config.Configuration");
+            Class<?> filter = Class.forName("org.apache.logging.log4j.core.filter.RegexFilter");
+            Class<?> filterInterface = Class.forName("org.apache.logging.log4j.core.Filter");
+
+            // ── DENY if message matches, NEUTRAL otherwise ──────────────
+            Object deny = Class.forName("org.apache.logging.log4j.core.Filter$Result")
+                    .getField("DENY").get(null);
+            Object neutral = Class.forName("org.apache.logging.log4j.core.Filter$Result")
+                    .getField("NEUTRAL").get(null);
+
+            // Build filter: RegexFilter.createFilter(regex, pattern, useRawMsg, level,
+            // onMatch, onMismatch)
+            Object regexFilter = filter.getMethod("createFilter", String.class,
+                    java.util.regex.Pattern.class, boolean.class,
+                    Class.forName("org.apache.logging.log4j.Level"),
+                    filterInterface, filterInterface)
+                    .invoke(null, "\\[connected player\\].*", null, false, null, deny, neutral);
+
+            // ── Apply to root configuration ─────────────────────────────
+            Object ctx = logManager.getMethod("getContext", boolean.class).invoke(null, false);
+            Object cfg = loggerContext.getMethod("getConfiguration").invoke(ctx);
+            configuration.getMethod("addFilter", filterInterface).invoke(cfg, regexFilter);
+            loggerContext.getMethod("updateLoggers").invoke(ctx);
+
+            logger.info("[WSMC] Suppressed Velocity connected-player log");
+        } catch (Exception e) {
+            // Non-critical – just log and continue
+            logger.warn("[WSMC] Could not suppress Velocity connected-player log: {}", e.getMessage());
         }
     }
 
